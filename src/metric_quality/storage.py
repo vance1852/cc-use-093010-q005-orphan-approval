@@ -13,6 +13,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS metric_batches(
  lot_id TEXT PRIMARY KEY, product TEXT NOT NULL, process_rev TEXT NOT NULL,
  sample_count INTEGER NOT NULL, status TEXT NOT NULL, owner TEXT NOT NULL,
+ revision INTEGER NOT NULL DEFAULT 1,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS measurements(
  measurement_id TEXT PRIMARY KEY, lot_id TEXT NOT NULL REFERENCES metric_batches(lot_id),
@@ -24,19 +25,35 @@ CREATE TABLE IF NOT EXISTS lot_events(
  event_type TEXT NOT NULL, actor TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals(
  lot_id TEXT NOT NULL, reviewer TEXT NOT NULL, decision TEXT NOT NULL,
- reason TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(lot_id,reviewer));
+ reason TEXT NOT NULL, expected_revision INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, PRIMARY KEY(lot_id,reviewer));
 """
+
+# 早期版本的数据库缺少乐观锁和幂等键列，连接时按列补齐。
+_MIGRATIONS = (
+    ("metric_batches", "revision", "revision INTEGER NOT NULL DEFAULT 1"),
+    ("approvals", "expected_revision", "expected_revision INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _migrate(db: sqlite3.Connection) -> None:
+    for table, column, ddl in _MIGRATIONS:
+        columns = {row[1] for row in db.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def connect(path: str = ":memory:") -> sqlite3.Connection:
-    db = sqlite3.connect(path)
+    # HTTP 服务在每个请求线程中使用同一连接，关闭线程亲和检查并设置锁等待超时。
+    db = sqlite3.connect(path, check_same_thread=False, timeout=10)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     db.executescript(SCHEMA)
+    _migrate(db)
     db.commit()
     return db
 
