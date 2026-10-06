@@ -12,11 +12,11 @@ def run() -> dict:
     service = MetricQualityService()
     service.bootstrap_admin()
     token = service.auth.login("admin", "metric-admin")
-    service.create_lot(token, "BATCH-DEMO", "cross-border-service-index", "POLICY-3.2", 10)
+    lot = service.create_lot(token, "BATCH-DEMO", "cross-border-service-index", "POLICY-3.2", 10)
     for report_period, response in ((450, .71), (520, .93), (650, .84)):
         service.add_measurement(token, "BATCH-DEMO", report_period, response, .01, "reporting-gateway-1")
     result = service.analyze(token, "BATCH-DEMO")
-    service.approve(token, "BATCH-DEMO", "hold", "awaiting data quality review")
+    service.approve(token, "BATCH-DEMO", "hold", "awaiting data quality review", lot["version"])
     return {"status": "ok", "batch": result["lot_id"], "peak_period": result["response_profile"]["peak_test_frequency_hz"], "events": len(service.audit(token, "BATCH-DEMO"))}
 
 

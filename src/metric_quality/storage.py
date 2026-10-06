@@ -13,6 +13,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS metric_batches(
  lot_id TEXT PRIMARY KEY, product TEXT NOT NULL, process_rev TEXT NOT NULL,
  sample_count INTEGER NOT NULL, status TEXT NOT NULL, owner TEXT NOT NULL,
+ version INTEGER NOT NULL DEFAULT 0,
  created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS measurements(
  measurement_id TEXT PRIMARY KEY, lot_id TEXT NOT NULL REFERENCES metric_batches(lot_id),
@@ -20,11 +21,13 @@ CREATE TABLE IF NOT EXISTS measurements(
  instrument TEXT NOT NULL, operator TEXT NOT NULL, measured_at TEXT NOT NULL,
  UNIQUE(lot_id,measurement_id));
 CREATE TABLE IF NOT EXISTS lot_events(
- event_id INTEGER PRIMARY KEY AUTOINCREMENT, lot_id TEXT NOT NULL,
+ event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+ lot_id TEXT NOT NULL REFERENCES metric_batches(lot_id),
  event_type TEXT NOT NULL, actor TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS approvals(
- lot_id TEXT NOT NULL, reviewer TEXT NOT NULL, decision TEXT NOT NULL,
- reason TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(lot_id,reviewer));
+ lot_id TEXT NOT NULL REFERENCES metric_batches(lot_id), reviewer TEXT NOT NULL,
+ decision TEXT NOT NULL, reason TEXT NOT NULL, lot_version INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL, PRIMARY KEY(lot_id,reviewer));
 """
 
 
@@ -32,11 +35,25 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def connect(path: str = ":memory:") -> sqlite3.Connection:
-    db = sqlite3.connect(path)
+def _migrate(db: sqlite3.Connection) -> None:
+    """为既有数据库补齐列，并清除失败请求留下的孤儿残片。"""
+    batch_columns = {row[1] for row in db.execute("PRAGMA table_info(metric_batches)")}
+    if "version" not in batch_columns:
+        db.execute("ALTER TABLE metric_batches ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+    approval_columns = {row[1] for row in db.execute("PRAGMA table_info(approvals)")}
+    if "lot_version" not in approval_columns:
+        db.execute("ALTER TABLE approvals ADD COLUMN lot_version INTEGER NOT NULL DEFAULT 0")
+    # 历史事故残片：审批或事件挂在不存在的批次上，同名批次建立后会被误读为有效历史
+    db.execute("DELETE FROM approvals WHERE lot_id NOT IN (SELECT lot_id FROM metric_batches)")
+    db.execute("DELETE FROM lot_events WHERE lot_id NOT IN (SELECT lot_id FROM metric_batches)")
+
+
+def connect(path: str = ":memory:", **kwargs) -> sqlite3.Connection:
+    db = sqlite3.connect(path, **kwargs)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA foreign_keys=ON")
     db.executescript(SCHEMA)
+    _migrate(db)
     db.commit()
     return db
 

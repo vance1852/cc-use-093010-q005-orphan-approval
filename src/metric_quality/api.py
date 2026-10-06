@@ -6,6 +6,7 @@ import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .errors import ServiceError, ValidationFailed
 from .service import MetricQualityService
 
 
@@ -20,35 +21,65 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _error(self, exc: Exception) -> None:
+        if isinstance(exc, ServiceError):
+            return self._json(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
+        if isinstance(exc, PermissionError):
+            return self._json(403, {"error": {"code": "forbidden", "message": str(exc)}})
+        if isinstance(exc, (KeyError, ValueError)):
+            return self._json(422, {"error": {"code": "validation_failed", "message": str(exc)}})
+        return self._json(500, {"error": {"code": "internal", "message": "internal error"}})
+
+    def _token(self) -> str:
+        return self.headers.get("Authorization", "").removeprefix("Bearer ")
+
+    def _body(self) -> dict:
+        try:
+            payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValidationFailed("请求体必须是 UTF-8 JSON 对象") from exc
+        if not isinstance(payload, dict):
+            raise ValidationFailed("请求体必须是 JSON 对象")
+        return payload
+
     def do_GET(self):
-        if self.path == "/health":
-            return self._json(200, {"status": "ok", "service": "metric-quality"})
-        if self.path.startswith("/lots/"):
-            try:
-                token = self.headers.get("Authorization", "").removeprefix("Bearer ")
-                return self._json(200, self.service.get_lot(token, self.path.split("/", 2)[2]))
-            except Exception as exc:
-                return self._json(400, {"error": str(exc)})
-        return self._json(404, {"error": "not found"})
+        try:
+            parts = [part for part in self.path.split("/") if part]
+            if self.path == "/health":
+                return self._json(200, {"status": "ok", "service": "metric-quality"})
+            if len(parts) == 2 and parts[0] == "lots":
+                return self._json(200, self.service.get_lot(self._token(), parts[1]))
+            if len(parts) == 3 and parts[0] == "lots" and parts[2] == "audit":
+                return self._json(200, {"events": self.service.audit(self._token(), parts[1])})
+            return self._json(404, {"error": {"code": "not_found", "message": "not found"}})
+        except Exception as exc:
+            return self._error(exc)
 
     def do_POST(self):
         try:
-            body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            parts = [part for part in self.path.split("/") if part]
+            body = self._body()
             if self.path == "/login":
                 return self._json(200, {"token": self.service.auth.login(body["user_id"], body["password"])})
-            token = self.headers.get("Authorization", "").removeprefix("Bearer ")
+            token = self._token()
             if self.path == "/lots":
-                return self._json(201, self.service.create_lot(token, body["lot_id"], body["product"], body["process_rev"], body["sample_count"]))
-            if self.path.startswith("/lots/") and self.path.endswith("/measurements"):
-                lot_id = self.path.split("/")[2]
-                return self._json(201, self.service.add_measurement(token, lot_id, body["test_frequency_hz"], body["response"], body.get("noise", 0.0), body["instrument"]))
-            if self.path.startswith("/lots/") and self.path.endswith("/analysis"):
-                return self._json(200, self.service.analyze(token, self.path.split("/")[2]))
-            return self._json(404, {"error": "not found"})
-        except PermissionError as exc:
-            return self._json(403, {"error": str(exc)})
+                return self._json(201, self.service.create_lot(token, body["lot_id"], body["product"], body["process_rev"], int(body["sample_count"])))
+            if len(parts) == 3 and parts[0] == "lots" and parts[2] == "measurements":
+                return self._json(201, self.service.add_measurement(token, parts[1], body["test_frequency_hz"], body["response"], body.get("noise", 0.0), body["instrument"]))
+            if len(parts) == 3 and parts[0] == "lots" and parts[2] == "analysis":
+                return self._json(200, self.service.analyze(token, parts[1]))
+            if len(parts) == 3 and parts[0] == "lots" and parts[2] == "approval":
+                return self._json(200, self.service.approve(token, parts[1], body["decision"], body["reason"], self._expected_version(body)))
+            return self._json(404, {"error": {"code": "not_found", "message": "not found"}})
         except Exception as exc:
-            return self._json(400, {"error": str(exc)})
+            return self._error(exc)
+
+    @staticmethod
+    def _expected_version(body: dict) -> int:
+        raw = body.get("expected_version")
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            raise ValidationFailed("expected_version 必须是非负整数")
+        return raw
 
 
 def main() -> None:
